@@ -1,0 +1,1928 @@
+-- Dark Hub | Blox Fruits | Fluent UI
+-- Main tab: Method Farm (Level / Katakuri / Bones / Tyrant Of The Skies) + Get Quest toggle
+-- Fly speed: 175
+
+local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+local SaveManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/SaveManager.lua"))()
+local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local VirtualUser = game:GetService("VirtualUser")
+local Player = Players.LocalPlayer
+
+local FLY_SPEED = 175
+local setStatus = function() end -- replaced by the real status line once the UI exists
+local CURRENT_SEA = ({[2753915549] = 1, [4442272183] = 2, [7449423635] = 3})[game.PlaceId]
+local HOVER_HEIGHT = 12
+local ATTACK_HEIGHT = 30   -- distance kept above the mob while attacking
+local ATTACK_RANGE = 60    -- fast attack reach (studs)
+
+-- Anti AFK
+Player.Idled:Connect(function()
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
+end)
+
+---------------------------------------------------------------------
+-- Farm data
+-- NOTE: quest NPC coordinates are approximate; adjust if needed.
+---------------------------------------------------------------------
+local Methods = {
+    ["Katakuri"] = {
+        Boss = "Cake Prince",
+        Extra = {"Katakuri"},
+        Mobs = {"Cookie Crafter", "Cake Guard", "Baking Staff", "Head Baker"},
+        QuestMob = "Cookie Crafter",
+        Quest = {Name = "CakeQuest1", Level = 1, NPC = CFrame.new(-1927.9, 37.98, -12842.5)},
+    },
+    ["Bones"] = {
+        Mobs = {"Reborn Skeleton", "Living Zombie", "Demonic Soul", "Posessed Mummy"},
+        QuestMob = "Reborn Skeleton",
+        Quest = {Name = "HauntedQuest1", Level = 1, NPC = CFrame.new(-9516.99, 172.01, 6078.46)},
+    },
+    ["Tyrant Of The Skies"] = {
+        Boss = "Tyrant of the Skies",
+        Mobs = {"Tyrant of the Skies"},
+    },
+}
+
+local State = {Method = "Level", GetQuest = false, Farming = false, FastAttack = true, Weapon = "Melee",
+    BringMob = false, BringCount = 3, AttackDelay = 0.1, CombatUntil = 0}
+
+---------------------------------------------------------------------
+-- Level method: picks the best quest for your level from the game's
+-- own quest table (ReplicatedStorage.Quests)
+---------------------------------------------------------------------
+local function getLevel()
+    local d = Player:FindFirstChild("Data")
+    return d and d:FindFirstChild("Level") and d.Level.Value or 1
+end
+
+-- Mob spawn points exist only for the sea you are in, so this tells us
+-- which quests belong to the current sea.
+local function spawnExists(mob)
+    local wo = workspace:FindFirstChild("_WorldOrigin")
+    local folder = wo and wo:FindFirstChild("EnemySpawns")
+    if not folder then return true end -- cannot verify: assume it exists
+    for _, s in ipairs(folder:GetChildren()) do
+        if s.Name:find(mob, 1, true) then return true end
+    end
+    return false
+end
+
+local SUBMERGED_MOBS = {["Reef Bandit"] = true, ["Coral Pirate"] = true, ["Sea Chanter"] = true,
+    ["Ocean Prophet"] = true, ["High Disciple"] = true, ["Grand Devotee"] = true}
+
+-- Submerged Island mobs are never listed next to the normal spawns, so in
+-- Sea 3 they always count as valid.
+local SEA3 = (game.PlaceId == 7449423635)
+local function questValid(mob)
+    if SEA3 and SUBMERGED_MOBS[mob] then return true end
+    return spawnExists(mob)
+end
+
+local levelCache = {lvl = nil, data = nil, t = 0, key = nil}
+
+-- All mob names that appear in the game's quest list
+local mobSet
+local function getMobSet()
+    if mobSet then return mobSet end
+    mobSet = {}
+    local ok, quests = pcall(function() return require(RS:WaitForChild("Quests", 5)) end)
+    if ok and type(quests) == "table" then
+        for _, levels in pairs(quests) do
+            if type(levels) == "table" then
+                for _, q in pairs(levels) do
+                    if type(q) == "table" and type(q.Task) == "table" then
+                        for n in pairs(q.Task) do mobSet[n] = true end
+                    end
+                end
+            end
+        end
+    end
+    return mobSet
+end
+
+-- Reads the quest you currently have and returns its mob (nil if none / finished)
+local function activeQuestMob()
+    local gui = Player.PlayerGui:FindFirstChild("Main")
+    local q = gui and gui:FindFirstChild("Quest")
+    if not q or not q.Visible then return end
+    local ok, text = pcall(function() return q.Container.QuestTitle.Title.Text end)
+    if not ok or type(text) ~= "string" then return end
+    local cur, max = text:match("(%d+)%s*/%s*(%d+)")
+    if cur and max and tonumber(cur) >= tonumber(max) then return end
+    local best
+    for name in pairs(getMobSet()) do
+        if text:find(name, 1, true) and (not best or #name > #best) then best = name end
+    end
+    return best
+end
+
+-- Sea travel (a level above 700 / 1500 belongs to Sea 2 / Sea 3)
+local SEA_TRAVEL = {"TravelMain", "TravelDressrosa", "TravelZou"}
+local lastSeaTravel, seaTravelTries = 0, 0
+
+-- Reads YOUR level, then picks the best quest for it in the current sea.
+local function getLevelQuest()
+    local lvl = getLevel()
+    local age = tick() - levelCache.t
+    if levelCache.lvl == lvl and (levelCache.data and age < 60 or age < 5) then
+        return levelCache.data
+    end
+    levelCache.lvl, levelCache.t = lvl, tick()
+
+    local ok, quests = pcall(function() return require(RS:WaitForChild("Quests", 5)) end)
+    if not ok or type(quests) ~= "table" then
+        levelCache.data = nil
+        warn("[Dark Hub] could not read the game's quest list")
+        return
+    end
+
+    -- strict = only quests whose mobs exist in this sea; the second pass
+    -- ignores that check so a quest is always found
+    local function pick(strict)
+        local best, bestReq = nil, -1
+        for questName, levels in pairs(quests) do
+            if type(levels) == "table" then
+                for idx, q in pairs(levels) do
+                    if type(q) == "table" and q.LevelReq and q.Task and q.LevelReq <= lvl and q.LevelReq > bestReq then
+                        local mobName, count
+                        for n, c in pairs(q.Task) do mobName, count = n, c end
+                        -- skip boss quests (kill 1)
+                        if mobName and count and count > 1 and (not strict or questValid(mobName)) then
+                            best, bestReq = {Name = questName, Level = idx, Mob = mobName}, q.LevelReq
+                        end
+                    end
+                end
+            end
+        end
+        return best
+    end
+
+    local best = pick(true) or pick(false)
+
+    if not best then
+        levelCache.data = nil
+        if levelCache.warned ~= lvl then
+            levelCache.warned = lvl
+            Fluent:Notify({Title = "Dark Hub", Content = "Level " .. lvl .. ": no quest found in this sea. Travel to the right sea.", Duration = 8})
+        end
+        return
+    end
+
+    levelCache.data = {
+        Mobs = {best.Mob},
+        QuestMob = best.Mob,
+        Label = best.Name .. " #" .. best.Level,
+        Quest = {Name = best.Name, Level = best.Level, NPC = nil}, -- NPC position auto-detected
+        Submerged = tostring(best.Name):find("Submerged") ~= nil or SUBMERGED_MOBS[best.Mob] == true,
+    }
+    local key = best.Name .. best.Level
+    if levelCache.key ~= key then
+        levelCache.key = key
+        Fluent:Notify({Title = "Dark Hub", Content = "Level " .. lvl .. " -> farming " .. best.Mob .. " (" .. best.Name .. " #" .. best.Level .. ")", Duration = 6})
+    end
+    return levelCache.data
+end
+
+---------------------------------------------------------------------
+-- Helpers
+---------------------------------------------------------------------
+local function getRoot()
+    local char = Player.Character
+    return char and char:FindFirstChild("HumanoidRootPart"), char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local bv
+local function setHover(on)
+    local root = getRoot()
+    if not root then return end
+    -- never start hovering after everything was switched off
+    if on and not State.Farming then return end
+    if on then
+        if not bv or bv.Parent ~= root then
+            bv = Instance.new("BodyVelocity")
+            bv.Name = "DarkHover"
+            bv.Velocity = Vector3.zero
+            bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+            bv.Parent = root
+        end
+    elseif bv then
+        bv:Destroy()
+        bv = nil
+    end
+end
+
+RunService.Stepped:Connect(function()
+    if State.Farming and Player.Character then
+        for _, p in ipairs(Player.Character:GetDescendants()) do
+            if p:IsA("BasePart") then p.CanCollide = false end
+        end
+    end
+end)
+
+local currentTween
+local function flyTo(cf)
+    -- once the farm is switched off no new flight may start; this was why
+    -- "Star Farm" seemed not to turn off (a half-finished step kept flying)
+    if not State.Farming then return end
+    local root = getRoot()
+    if not root then return end
+    local dist = (root.Position - cf.Position).Magnitude
+    if currentTween then currentTween:Cancel() end
+    currentTween = TweenService:Create(root, TweenInfo.new(dist / FLY_SPEED, Enum.EasingStyle.Linear), {CFrame = cf})
+    currentTween:Play()
+    return currentTween, dist / FLY_SPEED
+end
+
+-- Weapon chosen in "Settings Farm": "Melee", "Sword" or "Blox Fruit" (fruit M1)
+local function equipWeapon()
+    local char = Player.Character
+    if not char then return end
+    local cur = char:FindFirstChildOfClass("Tool")
+    if cur and cur.ToolTip == State.Weapon then return end
+    for _, t in ipairs(Player.Backpack:GetChildren()) do
+        if t:IsA("Tool") and t.ToolTip == State.Weapon then
+            char.Humanoid:EquipTool(t)
+            return
+        end
+    end
+end
+
+-- Fast attack: fires the game's combat remotes at every enemy in range,
+-- so the player can hit from a distance. Falls back to normal clicking.
+local Net = RS:FindFirstChild("Modules") and RS.Modules:FindFirstChild("Net")
+local RegisterAttack = Net and Net:FindFirstChild("RE/RegisterAttack")
+local RegisterHit = Net and Net:FindFirstChild("RE/RegisterHit")
+
+local function enemiesInRange()
+    local root = getRoot()
+    local list = {}
+    if not root then return list end
+    for _, mob in ipairs(workspace.Enemies:GetChildren()) do
+        local hrp = mob:FindFirstChild("HumanoidRootPart")
+        local hum = mob:FindFirstChildOfClass("Humanoid")
+        if hrp and hum and hum.Health > 0 and (hrp.Position - root.Position).Magnitude <= ATTACK_RANGE then
+            table.insert(list, mob)
+        end
+    end
+    return list
+end
+
+local function attack()
+    equipWeapon()
+    local list = enemiesInRange()
+    if State.Weapon == "Blox Fruit" then
+        -- fruit M1: normal click
+        VirtualUser:CaptureController()
+        VirtualUser:Button1Down(Vector2.new(1280, 672))
+        VirtualUser:Button1Up(Vector2.new(1280, 672))
+    elseif State.FastAttack and RegisterAttack and RegisterHit and #list > 0 then
+        local hits, first = {}, nil
+        for _, mob in ipairs(list) do
+            local part = mob:FindFirstChild("Head") or mob:FindFirstChild("HumanoidRootPart")
+            if part then
+                first = first or part
+                table.insert(hits, {mob, part})
+            end
+        end
+        pcall(function()
+            RegisterAttack:FireServer(0)
+            RegisterHit:FireServer(first, hits)
+        end)
+    else
+        VirtualUser:CaptureController()
+        VirtualUser:Button1Down(Vector2.new(1280, 672))
+    end
+end
+
+local function findEnemy(names)
+    local root = getRoot()
+    if not root then return end
+    local best, bestDist = nil, math.huge
+    for _, mob in ipairs(workspace.Enemies:GetChildren()) do
+        local hrp = mob:FindFirstChild("HumanoidRootPart")
+        local hum = mob:FindFirstChildOfClass("Humanoid")
+        if hrp and hum and hum.Health > 0 then
+            for _, n in ipairs(names) do
+                if mob.Name:find(n, 1, true) then
+                    local d = (hrp.Position - root.Position).Magnitude
+                    if d < bestDist then best, bestDist = mob, d end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Where mobs spawn (used when none are alive yet)
+local function findSpawn(names)
+    local root = getRoot()
+    local folder = workspace:FindFirstChild("_WorldOrigin") and workspace._WorldOrigin:FindFirstChild("EnemySpawns")
+    if not root or not folder then return end
+    local best, bestDist = nil, math.huge
+    for _, s in ipairs(folder:GetChildren()) do
+        for _, n in ipairs(names) do
+            if s.Name:find(n, 1, true) then
+                -- spawns can be parts or models: always return a part
+                local part = s:IsA("BasePart") and s or s:FindFirstChildWhichIsA("BasePart", true)
+                if part then
+                    local d = (part.Position - root.Position).Magnitude
+                    if d < bestDist then best, bestDist = part, d end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- True only while a quest is active AND not finished yet.
+-- Reads the kill counter in the quest window (e.g. "Reborn Skeleton 3/8").
+local function questUIActive()
+    local gui = Player.PlayerGui:FindFirstChild("Main")
+    local q = gui and gui:FindFirstChild("Quest")
+    if not q or not q.Visible then return false end
+
+    local ok, text = pcall(function()
+        return q.Container.QuestTitle.Title.Text
+    end)
+    if ok and type(text) == "string" then
+        local cur, max = text:match("(%d+)%s*/%s*(%d+)")
+        if cur and max and tonumber(cur) >= tonumber(max) then
+            return false -- finished: time to take the next quest
+        end
+    end
+    return true
+end
+
+-- After taking a quest the window can take a moment to appear (or flicker),
+-- so we trust the quest for a few seconds before judging by the window.
+local questTakenAt = 0
+local function hasQuest()
+    if tick() - questTakenAt < 8 then return true end
+    return questUIActive()
+end
+
+-- Flies to the quest NPC, takes the quest, then returns so the farm loop
+-- sends the player to the mobs.
+local lastQuestTry = 0
+local questGoneSince = nil -- when the quest window disappeared (debounce)
+local function takeQuest(data)
+    if not data.Quest then return end
+    if tick() - lastQuestTry < 6 then return end -- avoid ping-ponging to the NPC
+    lastQuestTry = tick()
+    -- NOTE: never abandon here. Abandoning is what used to cancel the
+    -- quest you had just taken.
+
+    local npcCF = data.Quest.NPC
+    if not npcCF then
+        -- no known NPC position: go near the mob spawn, quest NPCs are next to it
+        local sp = findSpawn(data.Mobs)
+        if sp then npcCF = sp.CFrame * CFrame.new(0, HOVER_HEIGHT, 0) end
+    end
+    if npcCF then
+        local t, time = flyTo(npcCF)
+        if t then t.Completed:Wait() end
+    end
+    if not State.Farming then return end -- switched off while flying
+    local function start()
+        pcall(function()
+            RS.Remotes.CommF_:InvokeServer("StartQuest", data.Quest.Name, data.Quest.Level)
+        end)
+        task.wait(0.6)
+    end
+    start()
+
+    -- not accepted? the quest NPC is probably a bit away from the spawn:
+    -- go to the closest NPC and try again
+    if not questUIActive() then
+        local sp = findSpawn(data.Mobs)
+        local npcs = workspace:FindFirstChild("NPCs")
+        if sp and npcs then
+            local bestPos, bestD = nil, 600
+            for _, n in ipairs(npcs:GetChildren()) do
+                local okp, p = pcall(function() return n:GetPivot().Position end)
+                if okp then
+                    local d = (p - sp.Position).Magnitude
+                    if d < bestD then bestPos, bestD = p, d end
+                end
+            end
+            if bestPos then
+                local t = flyTo(CFrame.new(bestPos + Vector3.new(0, 4, 0)))
+                if t then t.Completed:Wait() end
+                start()
+            end
+        end
+    end
+    questTakenAt = tick()
+end
+
+---------------------------------------------------------------------
+-- Extra automation: Elite Hunter / Castle Raid / Fruits
+-- NOTE: NPC and castle coordinates are approximate; adjust if needed.
+---------------------------------------------------------------------
+local ELITE_NPC = CFrame.new(-5418.9, 313.7, -2825.0)   -- Elite Hunter NPC (Castle on the Sea)
+local ELITE_NAMES = {"Diablo", "Deandre", "Urban"}
+local CASTLE_POS = Vector3.new(-5085.2, 316.5, -3156.2) -- Castle on the Sea
+local CASTLE_RADIUS = 600
+
+State.Elite = false
+State.Castle = false
+State.CollectFruits = false
+State.StoreFruits = false
+State.StartFarm = false
+State.Raid = false
+State.BuyChip = false
+State.ChipSource = "Beli"
+State.RaidFruit = "Flame"
+State.ChipBuyer = "Me"
+State.Boss = false
+State.BossSelected = {}
+State.SeaEvent = false
+State.SeaSelected = {}
+State.BoatName = "Pirate Brigade"
+State.UseSkills = true
+State.SkillsUntil = 0
+
+local RAID_FRUITS = {"Flame", "Ice", "Quake", "Light", "Dark", "String", "Rumble", "Magma", "Human: Buddha", "Sand", "Bird: Phoenix", "Dough"}
+
+local function refreshFarming()
+    State.Farming = State.MirageFind or State.MirageMoon or State.MirageV3 or State.MirageGears or State.KitsuneFind or State.KitsuneAuto or State.CollectEmbers or State.StartFarm or State.GetQuest or State.Elite or State.Castle or State.CollectFruits or State.Raid or State.BuyChip or State.Boss or State.SeaEvent
+    if not State.Farming then
+        setHover(false)
+        if currentTween then currentTween:Cancel() end
+        VirtualUser:Button1Up(Vector2.new(1280, 672))
+    end
+end
+
+-- Bring Mob: pulls up to State.BringCount mobs of the same type onto the target
+local function bringMobs(target)
+    if not State.BringMob then return end
+    local thrp = target:FindFirstChild("HumanoidRootPart")
+    if not thrp then return end
+    local count = 1
+    for _, mob in ipairs(workspace.Enemies:GetChildren()) do
+        if count >= State.BringCount then break end
+        if mob ~= target and mob.Name == target.Name then
+            local hrp = mob:FindFirstChild("HumanoidRootPart")
+            local hum = mob:FindFirstChildOfClass("Humanoid")
+            if hrp and hum and hum.Health > 0 and (hrp.Position - thrp.Position).Magnitude <= 350 then
+                hrp.CFrame = thrp.CFrame
+                hrp.CanCollide = false
+                count += 1
+            end
+        end
+    end
+end
+
+-- Kills the closest enemy matching data (boss/mobs). Returns true if busy.
+local function farmMobs(data)
+    local target
+    if data.Extra then target = findEnemy(data.Extra) end
+    if not target and data.Boss then target = findEnemy({data.Boss}) end
+    -- with a quest active, kill the quest's own mob first so it actually counts
+    if not target and data.QuestMob and State.GetQuest then target = findEnemy({data.QuestMob}) end
+    if not target and data.Mobs then target = findEnemy(data.Mobs) end
+
+    if target then
+        setHover(true)
+        local hrp = target.HumanoidRootPart
+        hrp.Size = Vector3.new(60, 60, 60)
+        hrp.CanCollide = false
+        bringMobs(target)
+        flyTo(hrp.CFrame * CFrame.new(0, ATTACK_HEIGHT, 0))
+        State.CombatUntil = tick() + 0.5
+        return true
+    end
+    return false
+end
+
+-- Auto Collect Fruits: flies to any dropped fruit in the map
+local function findFruit()
+    local root = getRoot()
+    if not root then return end
+    local best, bestDist = nil, math.huge
+    for _, obj in ipairs(workspace:GetChildren()) do
+        if (obj:IsA("Tool") or obj:IsA("Model")) and obj.Name:find("Fruit") then
+            local handle = obj:FindFirstChild("Handle") or obj:FindFirstChildWhichIsA("BasePart")
+            if handle then
+                local d = (handle.Position - root.Position).Magnitude
+                if d < bestDist then best, bestDist = handle, d end
+            end
+        end
+    end
+    return best
+end
+
+local function collectFruit()
+    local handle = findFruit()
+    if not handle then return false end
+    setHover(true)
+    local root = getRoot()
+    flyTo(handle.CFrame)
+    if root then pcall(function() firetouchinterest(root, handle, 0) firetouchinterest(root, handle, 1) end) end
+    return true
+end
+
+-- Auto Elite Hunter: takes the hunt, then kills Diablo / Deandre / Urban
+local lastElite = 0
+local function eliteHunter()
+    if farmMobs({Mobs = ELITE_NAMES}) then return true end
+    if tick() - lastElite > 6 then
+        lastElite = tick()
+        local t = flyTo(ELITE_NPC)
+        if t then t.Completed:Wait() end
+        pcall(function() RS.Remotes.CommF_:InvokeServer("EliteHunter") end)
+    end
+    return true
+end
+
+-- Auto Castle Raid: defends the Castle on the Sea against raiders
+local function castleRaid()
+    local root = getRoot()
+    if not root then return false end
+    local best, bestDist = nil, math.huge
+    for _, mob in ipairs(workspace.Enemies:GetChildren()) do
+        local hrp = mob:FindFirstChild("HumanoidRootPart")
+        local hum = mob:FindFirstChildOfClass("Humanoid")
+        if hrp and hum and hum.Health > 0 and (hrp.Position - CASTLE_POS).Magnitude <= CASTLE_RADIUS then
+            local d = (hrp.Position - root.Position).Magnitude
+            if d < bestDist then best, bestDist = mob, d end
+        end
+    end
+    if not best then return false end
+    setHover(true)
+    best.HumanoidRootPart.CanCollide = false
+    flyTo(best.HumanoidRootPart.CFrame * CFrame.new(0, ATTACK_HEIGHT, 0))
+    State.CombatUntil = tick() + 0.5
+    return true
+end
+
+---------------------------------------------------------------------
+-- Raid: buy chip, start raid, clear every island
+---------------------------------------------------------------------
+local function raidIslands()
+    local loc = workspace:FindFirstChild("_WorldOrigin") and workspace._WorldOrigin:FindFirstChild("Locations")
+    local list = {}
+    if loc then
+        for _, v in ipairs(loc:GetChildren()) do
+            if v.Name:find("^Island %d") and v:IsA("BasePart") then table.insert(list, v) end
+        end
+    end
+    table.sort(list, function(a, b) return a.Name < b.Name end)
+    return list
+end
+
+local function hasChip()
+    local char = Player.Character
+    return Player.Backpack:FindFirstChild("Special Microchip") or (char and char:FindFirstChild("Special Microchip"))
+end
+
+-- The raid console: Castle on the Sea (Sea 3) / Hot and Cold island (Sea 2)
+local function raidConsole()
+    local map = workspace:FindFirstChild("Map")
+    if not map then return end
+    local boat = map:FindFirstChild("Boat Castle")
+    local circle = map:FindFirstChild("CircleIsland")
+    local summon = (boat and boat:FindFirstChild("RaidSummon2")) or (circle and circle:FindFirstChild("RaidSummon"))
+    return summon and summon:FindFirstChild("Button") and summon.Button:FindFirstChild("Main")
+end
+
+local function raidLabPos()
+    local b = raidConsole()
+    if b then return b.Position end
+    if CURRENT_SEA == 3 then return CASTLE_POS end              -- Castle on the Sea
+    return Vector3.new(-6438.7, 250.6, -4501.5)                 -- Hot and Cold island (Sea 2)
+end
+
+local function scientistPos()
+    local npcs = workspace:FindFirstChild("NPCs")
+    local n = npcs and npcs:FindFirstChild("Mysterious Scientist")
+    if n then
+        local ok, p = pcall(function() return n:GetPivot().Position end)
+        if ok then return p end
+    end
+    return raidLabPos()
+end
+
+-- Flies close to pos. Returns true once we are there.
+local function flyNear(pos, radius, height)
+    local root, hum = getRoot()
+    if not root then return false end
+    if (root.Position - pos).Magnitude <= radius then return true end
+    if hum and hum.SeatPart then hum.Jump = true end
+    setHover(true)
+    local t = flyTo(CFrame.new(pos + Vector3.new(0, height or 4, 0)))
+    if t then t.Completed:Wait() end
+    return false
+end
+
+-- Buys the chip for the selected raid at the Mysterious Scientist.
+-- The server only sells when you are standing next to him, so we fly there first.
+local lastBuy, buyFails = 0, 0
+local function buyChip()
+    if not flyNear(scientistPos(), 25, 4) then return end
+    if tick() - lastBuy < 5 then return end
+    lastBuy = tick()
+
+    if State.ChipSource == "Fruit" then
+        local char = Player.Character
+        for _, t in ipairs(Player.Backpack:GetChildren()) do
+            if t:IsA("Tool") and t.ToolTip == "Blox Fruit" and char then
+                char.Humanoid:EquipTool(t)
+                break
+            end
+        end
+    end
+    pcall(function() RS.Remotes.CommF_:InvokeServer("RaidsNpc", "Select", State.RaidFruit) end)
+    task.wait(1.2)
+
+    if hasChip() then
+        buyFails = 0
+    else
+        buyFails += 1
+        if buyFails == 3 then
+            Fluent:Notify({Title = "Dark Hub", Content = "Could not buy the chip. Check you have enough Beli / the fruit and that the raid is unlocked.", Duration = 8})
+        end
+    end
+end
+
+local lastStart = 0
+local function startRaid()
+    local b = raidConsole()
+    if not flyNear(b and b.Position or raidLabPos(), 12, 5) then return end
+    if not b or tick() - lastStart < 6 then return end
+    lastStart = tick()
+    pcall(function() fireclickdetector(b.ClickDetector) end)
+end
+
+-- Someone else buys the chip: stand on a platform next to the console and wait
+local function waitAtPlatform()
+    local pos = raidLabPos()
+    local ang = (Player.UserId % 6) * math.pi / 3 -- every player gets its own spot
+    local spot = pos + Vector3.new(math.cos(ang) * 10, 3, math.sin(ang) * 10)
+    flyNear(spot, 6, 0)
+end
+
+-- Returns true while busy with the raid
+local function raidFarm()
+    if CURRENT_SEA == 1 then
+        setStatus("Raid | raids only exist in Sea 2 and Sea 3")
+        return false
+    end
+    local islands = raidIslands()
+    local buyerIsMe = (State.ChipBuyer == "Me")
+
+    -- only "Auto Buy Chip" is on: just keep a chip in the bag
+    if not State.Raid then
+        if State.BuyChip and buyerIsMe and #islands == 0 and not hasChip() then
+            setStatus("Raid | buying the " .. State.RaidFruit .. " chip")
+            buyChip()
+            return true
+        end
+        return false
+    end
+
+    if #islands == 0 then
+        if buyerIsMe then
+            if not hasChip() then
+                setStatus("Raid | buying the " .. State.RaidFruit .. " chip")
+                buyChip()
+            else
+                setStatus("Raid | starting the raid at the console")
+                startRaid()
+            end
+        else
+            local present = Players:FindFirstChild(State.ChipBuyer) ~= nil
+            setStatus("Raid | waiting on the platform for " .. tostring(State.ChipBuyer) .. (present and "" or " (not in this server)") .. " to start")
+            waitAtPlatform()
+        end
+        return true
+    end
+
+    local root = getRoot()
+    if not root then return true end
+    local best, bestDist = nil, math.huge
+    for _, mob in ipairs(workspace.Enemies:GetChildren()) do
+        local hrp = mob:FindFirstChild("HumanoidRootPart")
+        local hum = mob:FindFirstChildOfClass("Humanoid")
+        if hrp and hum and hum.Health > 0 then
+            for _, isl in ipairs(islands) do
+                if (hrp.Position - isl.Position).Magnitude <= 700 then
+                    local d = (hrp.Position - root.Position).Magnitude
+                    if d < bestDist then best, bestDist = mob, d end
+                    break
+                end
+            end
+        end
+    end
+
+    setHover(true)
+    if best then
+        setStatus("Raid | fighting")
+        bringMobs(best)
+        best.HumanoidRootPart.CanCollide = false
+        flyTo(best.HumanoidRootPart.CFrame * CFrame.new(0, ATTACK_HEIGHT, 0))
+        State.CombatUntil = tick() + 0.5
+    else
+        -- island cleared: move on to the latest island so the next one spawns
+        setStatus("Raid | going to the next island")
+        flyTo(islands[#islands].CFrame * CFrame.new(0, 60, 0))
+    end
+    return true
+end
+
+---------------------------------------------------------------------
+-- Boss: kills the selected mega bosses whenever they are spawned
+-- (display name -> name used in workspace.Enemies)
+---------------------------------------------------------------------
+local BOSS_LIST = {
+    "Dough King", "Rip Indra", "Soul Reaper", "Cake Prince", "Darkbeard", "Order",
+    "Tyrant Of The Skies", "Cursed Captain", "Island Empress", "Kilo Admiral",
+    "Captain Elephant", "Beautiful Pirate", "Cake Queen", "Longma", "Stone", "Greybeard",
+}
+local BOSS_NAMES = {
+    ["Dough King"] = "Dough King",
+    ["Rip Indra"] = "rip_indra",
+    ["Soul Reaper"] = "Soul Reaper",
+    ["Cake Prince"] = "Cake Prince",
+    ["Darkbeard"] = "Darkbeard",
+    ["Order"] = "Order",
+    ["Tyrant Of The Skies"] = "Tyrant of the Skies",
+    ["Cursed Captain"] = "Cursed Captain",
+    ["Island Empress"] = "Island Empress",
+    ["Kilo Admiral"] = "Kilo Admiral",
+    ["Captain Elephant"] = "Captain Elephant",
+    ["Beautiful Pirate"] = "Beautiful Pirate",
+    ["Cake Queen"] = "Cake Queen",
+    ["Longma"] = "Longma",
+    ["Stone"] = "Stone",
+    ["Greybeard"] = "Greybeard",
+}
+
+-- Returns true while a selected boss is alive and being fought
+local function bossFarm()
+    local names = {}
+    for display, on in pairs(State.BossSelected) do
+        if on and BOSS_NAMES[display] then table.insert(names, BOSS_NAMES[display]) end
+    end
+    if #names == 0 then return false end
+    return farmMobs({Mobs = names})
+end
+
+---------------------------------------------------------------------
+-- Sea Events: buy/sail a boat, hunt the selected events
+-- NOTE: boat/event internal names can change with game updates.
+---------------------------------------------------------------------
+local VIM = game:GetService("VirtualInputManager")
+
+local BOAT_LIST = {"Pirate Brigade", "Pirate Grand Brigade", "Marine Brigade", "Marine Grand Brigade", "Beast Hunter", "Sloop", "Dinghy"}
+local BOAT_IDS = {
+    ["Pirate Brigade"] = "PirateBrigade",
+    ["Pirate Grand Brigade"] = "PirateGrandBrigade",
+    ["Marine Brigade"] = "MarineBrigade",
+    ["Marine Grand Brigade"] = "MarineGrandBrigade",
+    ["Beast Hunter"] = "BeastHunter",
+    ["Sloop"] = "Sloop",
+    ["Dinghy"] = "Dinghy",
+}
+local SEA_EVENT_LIST = {"Terrorshark", "Sea Beast", "Piranha", "Fish Crew", "Pirate Brigade", "Ghost Ship"}
+-- events where every skill (sword, melee, gun, fruit) is thrown
+local SKILL_EVENTS = {["Sea Beast"] = true, ["Pirate Brigade"] = true, ["Ghost Ship"] = true}
+
+local SAIL_SPEED = 150
+local SAIL_MAX_DIST = 3500
+
+local function partOf(model)
+    return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function isMyBoat(boat)
+    local owner = boat:FindFirstChild("Owner")
+    return owner and owner.Value == Player
+end
+
+local function myBoat()
+    local boats = workspace:FindFirstChild("Boats")
+    if not boats then return end
+    for _, b in ipairs(boats:GetChildren()) do
+        if isMyBoat(b) then return b end
+    end
+end
+
+-- Finds the closest selected event. Returns model, eventName
+local function findSeaTarget()
+    local root = getRoot()
+    if not root then return end
+    local best, bestEv, bestDist = nil, nil, math.huge
+
+    local function consider(model, ev)
+        local p = partOf(model)
+        if p then
+            local d = (p.Position - root.Position).Magnitude
+            if d < bestDist then best, bestEv, bestDist = model, ev, d end
+        end
+    end
+
+    for ev, on in pairs(State.SeaSelected) do
+        if on then
+            if ev == "Terrorshark" or ev == "Piranha" or ev == "Fish Crew" then
+                local pattern = (ev == "Fish Crew") and "Fish Crew" or ev
+                for _, m in ipairs(workspace.Enemies:GetChildren()) do
+                    local hum = m:FindFirstChildOfClass("Humanoid")
+                    if m.Name:find(pattern) and hum and hum.Health > 0 then consider(m, ev) end
+                end
+            elseif ev == "Sea Beast" then
+                local folder = workspace:FindFirstChild("SeaBeasts")
+                if folder then
+                    for _, m in ipairs(folder:GetChildren()) do consider(m, ev) end
+                end
+            elseif ev == "Pirate Brigade" or ev == "Ghost Ship" then
+                local boats = workspace:FindFirstChild("Boats")
+                if boats then
+                    for _, b in ipairs(boats:GetChildren()) do
+                        if not isMyBoat(b) then
+                            if (ev == "Pirate Brigade" and b.Name:find("Brigade")) or (ev == "Ghost Ship" and b.Name:find("Ghost")) then
+                                consider(b, ev)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best, bestEv
+end
+
+local function pressKey(key)
+    VIM:SendKeyEvent(true, key, false, game)
+    task.wait(0.05)
+    VIM:SendKeyEvent(false, key, false, game)
+end
+
+-- Race ability (V3 / the "T" button). Uses the game's remote so it works
+-- on mobile too, where there is no keyboard.
+local function useRaceAbility()
+    local ok = pcall(function()
+        RS.Remotes.CommE:FireServer("ActivateAbility")
+    end)
+    if not ok then pcall(pressKey, Enum.KeyCode.T) end
+end
+
+-- Throws every skill of every weapon type: Melee, Sword, Gun and Blox Fruit
+local function allSkills()
+    local char = Player.Character
+    if not char then return end
+    local keys = {Enum.KeyCode.Z, Enum.KeyCode.X, Enum.KeyCode.C, Enum.KeyCode.V, Enum.KeyCode.F}
+    for _, kind in ipairs({"Melee", "Sword", "Gun", "Blox Fruit"}) do
+        local tool
+        local cur = char:FindFirstChildOfClass("Tool")
+        if cur and cur.ToolTip == kind then
+            tool = cur
+        else
+            for _, t in ipairs(Player.Backpack:GetChildren()) do
+                if t:IsA("Tool") and t.ToolTip == kind then tool = t break end
+            end
+        end
+        if tool then
+            if tool.Parent ~= char then char.Humanoid:EquipTool(tool) end
+            task.wait(0.15)
+            for _, k in ipairs(keys) do
+                pressKey(k)
+                task.wait(0.2)
+            end
+        end
+    end
+end
+
+task.spawn(function()
+    while task.wait(0.3) do
+        if State.SeaEvent and State.UseSkills and tick() < State.SkillsUntil then
+            pcall(allSkills)
+        end
+    end
+end)
+
+local lastBoatBuy = 0
+local sailStart
+
+-- Tiki Outpost docks: boats are bought here before sailing out.
+local TIKI_DOCK = Vector3.new(-16269.7, 25.2, 1373.4) -- approximate; the dealer NPC is used when found
+
+local function boatDealerPos()
+    local npcs = workspace:FindFirstChild("NPCs")
+    local best, bestD = nil, math.huge
+    if npcs then
+        for _, n in ipairs(npcs:GetChildren()) do
+            if n.Name:find("Boat", 1, true) then
+                local okp, p = pcall(function() return n:GetPivot().Position end)
+                if okp then
+                    local d = (p - TIKI_DOCK).Magnitude
+                    if d < bestD then best, bestD = p, d end
+                end
+            end
+        end
+    end
+    -- only trust a dealer that is actually at Tiki Outpost
+    if best and bestD < 1500 then return best end
+    return TIKI_DOCK
+end
+
+-- Goes to Tiki Outpost, gets on the boat (buying it if needed) and sails
+-- straight out to sea.
+local function exploreSea(root, hum)
+    local boat = myBoat()
+    if not boat then
+        -- 1) no boat yet: go to the Tiki Outpost boat dealer
+        local dealer = boatDealerPos()
+        if (root.Position - dealer).Magnitude > 40 then
+            if hum.SeatPart then hum.Jump = true end
+            setHover(true)
+            local t = flyTo(CFrame.new(dealer + Vector3.new(0, 4, 0)))
+            if t then t.Completed:Wait() end
+            return true
+        end
+        -- 2) at the dealer: buy the selected boat
+        if tick() - lastBoatBuy > 10 then
+            lastBoatBuy = tick()
+            sailStart = nil
+            pcall(function()
+                RS.Remotes.CommF_:InvokeServer("BuyBoat", BOAT_IDS[State.BoatName] or State.BoatName)
+            end)
+        end
+        return true
+    end
+
+    local seat = boat:FindFirstChild("VehicleSeat") or boat:FindFirstChildWhichIsA("VehicleSeat", true)
+    if not seat then return true end
+    setHover(false)
+    if hum.SeatPart ~= seat then
+        root.CFrame = seat.CFrame * CFrame.new(0, 3, 0)
+        return true
+    end
+
+    sailStart = sailStart or boat:GetPivot().Position
+    if (boat:GetPivot().Position - sailStart).Magnitude < SAIL_MAX_DIST then
+        boat:PivotTo(boat:GetPivot() + boat:GetPivot().LookVector * (SAIL_SPEED * 0.15))
+    end
+    return true
+end
+
+local function seaEvents()
+    local root, hum = getRoot()
+    if not root or not hum then return true end
+
+    -- 1) an event is up: leave the boat and fight it
+    local target, ev = findSeaTarget()
+    if target then
+        if hum.SeatPart then hum.Jump = true end
+        setHover(true)
+        local p = partOf(target)
+        flyTo(p.CFrame * CFrame.new(0, SKILL_EVENTS[ev] and 55 or ATTACK_HEIGHT, 0))
+        State.CombatUntil = tick() + 0.5
+        if SKILL_EVENTS[ev] then State.SkillsUntil = tick() + 1 end
+        return true
+    end
+
+    -- 2) no event: get on the boat and sail out to sea
+    return exploreSea(root, hum)
+end
+
+---------------------------------------------------------------------
+-- Kitsune Island: find it, collect Azure Embers, trade them
+-- NOTE: object/remote names are best guesses and can change with updates.
+---------------------------------------------------------------------
+State.KitsuneFind = false
+State.KitsuneAuto = false
+State.CollectEmbers = false
+State.TradeEmbers = false
+State.TradeAmount = 5
+
+local TRADE_REMOTE = "KitsuneStatuePray" -- remote used to trade embers (adjust if the game changes it)
+local kitsuneNotified = false
+
+local function kitsunePos()
+    local loc = workspace:FindFirstChild("_WorldOrigin") and workspace._WorldOrigin:FindFirstChild("Locations")
+    local part = loc and (loc:FindFirstChild("Kitsune Island") or loc:FindFirstChild("KitsuneIsland"))
+    if part and part:IsA("BasePart") then return part.Position end
+    local map = workspace:FindFirstChild("Map")
+    local isl = map and (map:FindFirstChild("KitsuneIsland") or map:FindFirstChild("Kitsune Island"))
+    if isl then return isl:GetPivot().Position end
+end
+
+local function findEmber()
+    local root = getRoot()
+    if not root then return end
+    local best, bestDist = nil, math.huge
+    local function check(obj)
+        if obj.Name:find("Ember") then
+            local p = obj:IsA("BasePart") and obj or obj:FindFirstChildWhichIsA("BasePart", true)
+            if p then
+                local d = (p.Position - root.Position).Magnitude
+                if d < bestDist then best, bestDist = p, d end
+            end
+        end
+    end
+    for _, o in ipairs(workspace:GetChildren()) do check(o) end
+    local map = workspace:FindFirstChild("Map")
+    local isl = map and (map:FindFirstChild("KitsuneIsland") or map:FindFirstChild("Kitsune Island"))
+    if isl then
+        for _, o in ipairs(isl:GetDescendants()) do check(o) end
+    end
+    return best
+end
+
+-- Returns true while busy with Kitsune Island tasks
+local function kitsuneTick()
+    local root, hum = getRoot()
+    if not root or not hum then return true end
+
+    -- Auto Collect Azure Embers
+    if State.CollectEmbers then
+        local ember = findEmber()
+        if ember then
+            if hum.SeatPart then hum.Jump = true end
+            setHover(true)
+            flyTo(ember.CFrame)
+            pcall(function()
+                firetouchinterest(root, ember, 0)
+                firetouchinterest(root, ember, 1)
+            end)
+            return true
+        end
+    end
+
+    local pos = kitsunePos()
+    if State.KitsuneFind or State.KitsuneAuto then
+        if not pos then
+            return exploreSea(root, hum) -- keep sailing until the island shows up
+        end
+        if not kitsuneNotified then
+            kitsuneNotified = true
+            Fluent:Notify({Title = "Dark Hub", Content = "Kitsune Island found!", Duration = 6})
+        end
+        if State.KitsuneAuto then
+            if hum.SeatPart then hum.Jump = true end
+            setHover(true)
+            if (root.Position - pos).Magnitude > 60 then
+                flyTo(CFrame.new(pos + Vector3.new(0, 80, 0)))
+            end
+            return true
+        end
+    end
+    return false
+end
+
+-- Auto Trade Embers: trades State.TradeAmount at a time
+task.spawn(function()
+    while task.wait(5) do
+        if State.TradeEmbers then
+            pcall(function()
+                RS.Remotes.CommF_:InvokeServer(TRADE_REMOTE, State.TradeAmount)
+            end)
+        end
+    end
+end)
+
+---------------------------------------------------------------------
+-- Mirage Island: find it, climb to the highest point, look at the moon,
+-- activate V3 (race ability) and collect gears.
+-- NOTE: object names are best guesses and can change with updates.
+---------------------------------------------------------------------
+State.MirageFind = false
+State.MirageMoon = false
+State.MirageV3 = false
+State.MirageGears = false
+
+local Lighting = game:GetService("Lighting")
+local mirageNotified = false
+local mirageTop, mirageTopFor
+local lastV3 = 0
+
+local function mirageModel()
+    local map = workspace:FindFirstChild("Map")
+    return map and (map:FindFirstChild("MysticIsland") or map:FindFirstChild("Mirage Island"))
+end
+
+local function miragePos()
+    local loc = workspace:FindFirstChild("_WorldOrigin") and workspace._WorldOrigin:FindFirstChild("Locations")
+    local part = loc and (loc:FindFirstChild("Mirage Island") or loc:FindFirstChild("MirageIsland"))
+    if part and part:IsA("BasePart") then return part.Position end
+    local m = mirageModel()
+    if m then return m:GetPivot().Position end
+end
+
+-- Highest point of the island (cached per island)
+local function getMirageTop()
+    local m = mirageModel()
+    if not m then mirageTop, mirageTopFor = nil, nil return end
+    if mirageTop and mirageTopFor == m then return mirageTop end
+    local best
+    for _, p in ipairs(m:GetDescendants()) do
+        if p:IsA("BasePart") and (not best or p.Position.Y > best.Y) then best = p.Position end
+    end
+    mirageTop, mirageTopFor = best, m
+    return best
+end
+
+local function findGear()
+    local m = mirageModel()
+    local root = getRoot()
+    if not m or not root then return end
+    local best, bestDist = nil, math.huge
+    for _, o in ipairs(m:GetDescendants()) do
+        if o.Name:find("Gear") then
+            local p = o:IsA("BasePart") and o or o:FindFirstChildWhichIsA("BasePart", true)
+            if p then
+                local d = (p.Position - root.Position).Magnitude
+                if d < bestDist then best, bestDist = p, d end
+            end
+        end
+    end
+    return best
+end
+
+local function restoreCamera()
+    local cam = workspace.CurrentCamera
+    if cam and cam.CameraType == Enum.CameraType.Scriptable then
+        cam.CameraType = Enum.CameraType.Custom
+    end
+end
+
+local function lookAtMoon()
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    cam.CameraType = Enum.CameraType.Scriptable
+    cam.CFrame = CFrame.lookAt(cam.CFrame.Position, cam.CFrame.Position + Lighting:GetMoonDirection())
+end
+
+-- Returns true while busy with Mirage Island tasks
+local function mirageTick()
+    local root, hum = getRoot()
+    if not root or not hum then return true end
+
+    local pos = miragePos()
+    if not pos then
+        return exploreSea(root, hum) -- keep sailing until Mirage Island spawns
+    end
+    if not mirageNotified then
+        mirageNotified = true
+        Fluent:Notify({Title = "Dark Hub", Content = "Mirage Island found!", Duration = 6})
+    end
+
+    -- Auto collect gears
+    if State.MirageGears then
+        local gear = findGear()
+        if gear then
+            if hum.SeatPart then hum.Jump = true end
+            setHover(true)
+            flyTo(gear.CFrame)
+            pcall(function()
+                firetouchinterest(root, gear, 0)
+                firetouchinterest(root, gear, 1)
+                local prompt = gear:FindFirstChildWhichIsA("ProximityPrompt", true)
+                if prompt then fireproximityprompt(prompt) end
+                local click = gear:FindFirstChildWhichIsA("ClickDetector", true)
+                if click then fireclickdetector(click) end
+            end)
+            return true
+        end
+    end
+
+    -- Highest point + look at the moon (+ V3)
+    if State.MirageMoon or State.MirageV3 then
+        local top = getMirageTop()
+        if top then
+            if hum.SeatPart then hum.Jump = true end
+            setHover(true)
+            local target = top + Vector3.new(0, 8, 0)
+            if (root.Position - target).Magnitude > 12 then
+                flyTo(CFrame.new(target))
+            else
+                lookAtMoon()
+                if State.MirageV3 and tick() - lastV3 > 4 then
+                    lastV3 = tick()
+                    useRaceAbility() -- race ability (V3)
+                end
+            end
+            return true
+        end
+    end
+    return false
+end
+
+---------------------------------------------------------------------
+-- Race abilities: V3 (T) and V4 awakening (Y). One implementation only.
+---------------------------------------------------------------------
+State.AutoV3 = false
+State.AutoV4 = false
+
+task.spawn(function()
+    local lastT, lastY = 0, 0
+    while task.wait(0.5) do
+        if not State.Farming then continue end
+        pcall(function()
+            local char = Player.Character
+            if not char then return end
+
+            -- V3: the game's own remote, so it also works on mobile (no keyboard)
+            if State.AutoV3 and tick() - lastT > 3 then
+                lastT = tick()
+                useRaceAbility()
+            end
+
+            -- V4: only when the awakening bar is full and V4 is not already on
+            if State.AutoV4 and tick() - lastY > 8 then
+                local energy = char:FindFirstChild("RaceEnergy")
+                local on = char:FindFirstChild("RaceTransformed")
+                local full = (not energy) or energy.Value >= 1
+                if full and not (on and on.Value) then
+                    lastY = tick()
+                    pressKey(Enum.KeyCode.Y)
+                    if keypress and keyrelease then
+                        pcall(function() keypress(0x59) task.wait(0.05) keyrelease(0x59) end)
+                    end
+                end
+            end
+        end)
+    end
+end)
+
+---------------------------------------------------------------------
+-- Submerged Island: if the quest is down there, go to the Submarine
+-- Worker at Tiki Outpost and travel to the island first.
+---------------------------------------------------------------------
+local TIKI_POS = Vector3.new(-16269.7, 25.2, 1373.4) -- approximate Submarine Worker position
+local lastSubTravel = 0
+
+local function submarineNPC()
+    local npcs = workspace:FindFirstChild("NPCs")
+    return npcs and npcs:FindFirstChild("Submarine Worker")
+end
+
+local function goSubmerged()
+    if tick() - lastSubTravel < 15 then return end
+    lastSubTravel = tick()
+    local npc = submarineNPC()
+    local pos = npc and npc:GetPivot().Position or TIKI_POS
+    local t = flyTo(CFrame.new(pos + Vector3.new(0, 4, 0)))
+    if t then t.Completed:Wait() end
+    if not State.Farming then return end
+    pcall(function()
+        RS.Remotes.CommF_:InvokeServer("SubmarineWorkerSpeak", "TravelToSubmergedIsland")
+    end)
+    State.SubUntil = tick() + 30 -- assume we are down there for a while
+    task.wait(4)
+end
+
+-- Auto Store Fruit: stores any fruit in your backpack
+task.spawn(function()
+    while task.wait(2) do
+        if not State.StoreFruits then continue end
+        pcall(function()
+            local containers = {Player.Backpack, Player.Character}
+            for _, c in ipairs(containers) do
+                if c then
+                    for _, tool in ipairs(c:GetChildren()) do
+                        if tool:IsA("Tool") and (tool.ToolTip == "Blox Fruit" or tool.Name:find("Fruit")) then
+                            local name = tool:GetAttribute("OriginalName") or tool.Name
+                            RS.Remotes.CommF_:InvokeServer("StoreFruit", name, tool)
+                        end
+                    end
+                end
+            end
+        end)
+    end
+end)
+
+---------------------------------------------------------------------
+-- UI
+---------------------------------------------------------------------
+local Window = Fluent:CreateWindow({
+    Title = "Dark Hub",
+    SubTitle = "Blox Fruits",
+    TabWidth = 160,
+    Size = UDim2.fromOffset(520, 360),
+    Acrylic = true,
+    Theme = "Dark",
+    MinimizeKey = Enum.KeyCode.LeftControl,
+})
+
+local Tabs = {
+    Main = Window:AddTab({Title = "Main", Icon = "home"}),
+    FarmSettings = Window:AddTab({Title = "Settings Farm", Icon = "swords"}),
+    Raid = Window:AddTab({Title = "Raid", Icon = "flame"}),
+    Boss = Window:AddTab({Title = "Boss", Icon = "skull"}),
+    Sea = Window:AddTab({Title = "Sea Events", Icon = "anchor"}),
+    Settings = Window:AddTab({Title = "Settings", Icon = "settings"}),
+}
+
+-- Status line: shows your level, the quest/mob picked and what the script is doing
+local StatusPara
+pcall(function()
+    StatusPara = Tabs.Main:AddParagraph({Title = "Status", Content = "Idle"})
+end)
+local lastStatus
+setStatus = function(text)
+    if text == lastStatus then return end
+    lastStatus = text
+    if StatusPara then pcall(function() StatusPara:SetDesc(text) end) end
+end
+
+Tabs.Main:AddDropdown("MethodFarm", {
+    Title = "Method Farm",
+    Values = {"Level", "Katakuri", "Bones", "Tyrant Of The Skies"},
+    Multi = false,
+    Default = 1,
+}):OnChanged(function(v)
+    if State.Method ~= v then
+        -- method changed: drop the old quest so the new one can be taken
+        pcall(function() RS.Remotes.CommF_:InvokeServer("AbandonQuest") end)
+    end
+    State.Method = v
+    lastQuestTry = 0
+    questGoneSince = nil
+end)
+
+Tabs.Main:AddToggle("StarFarm", {
+    Title = "Star Farm",
+    Description = "Starts farming the selected Method Farm",
+    Default = false,
+}):OnChanged(function(v)
+    State.StartFarm = v
+    refreshFarming()
+end)
+
+Tabs.Main:AddToggle("GetQuest", {
+    Title = "Get Quest",
+    Description = "Takes the NPC quest and only returns to the NPC when the quest is finished",
+    Default = false,
+}):OnChanged(function(v)
+    State.GetQuest = v
+    lastQuestTry = 0
+    questGoneSince = nil
+    refreshFarming()
+end)
+
+Tabs.Main:AddToggle("AutoEliteHunter", {
+    Title = "Auto Elite Hunter",
+    Description = "Takes the Elite Hunter quest and kills Diablo / Deandre / Urban",
+    Default = false,
+}):OnChanged(function(v)
+    State.Elite = v
+    lastElite = 0
+    refreshFarming()
+end)
+
+Tabs.Main:AddToggle("AutoCastleRaid", {
+    Title = "Auto Castle Raid",
+    Description = "Defends the Castle on the Sea from raiders",
+    Default = false,
+}):OnChanged(function(v)
+    State.Castle = v
+    refreshFarming()
+end)
+
+Tabs.Main:AddToggle("AutoCollectFruits", {
+    Title = "Auto Collect Fruits",
+    Description = "Flies to fruits spawned on the map",
+    Default = false,
+}):OnChanged(function(v)
+    State.CollectFruits = v
+    refreshFarming()
+end)
+
+Tabs.Main:AddToggle("AutoStoreFruit", {
+    Title = "Auto Store Fruit",
+    Description = "Stores fruits from your backpack automatically",
+    Default = false,
+}):OnChanged(function(v)
+    State.StoreFruits = v
+end)
+
+Tabs.FarmSettings:AddDropdown("FarmWeapon", {
+    Title = "Farm Weapon",
+    Description = "What you use to farm: Melee, Sword or Blox Fruit (M1)",
+    Values = {"Melee", "Sword", "Blox Fruit"},
+    Multi = false,
+    Default = 1,
+}):OnChanged(function(v)
+    State.Weapon = v
+end)
+
+Tabs.FarmSettings:AddSlider("AttackDistance", {
+    Title = "Attack Distance",
+    Description = "How far above the mob you hover",
+    Default = ATTACK_HEIGHT,
+    Min = 10,
+    Max = 60,
+    Rounding = 0,
+}):OnChanged(function(v)
+    ATTACK_HEIGHT = v
+    ATTACK_RANGE = math.max(ATTACK_RANGE, v + 30)
+end)
+
+Tabs.FarmSettings:AddToggle("FastAttack", {
+    Title = "Fast Attack",
+    Description = "Hits every mob in range from a distance",
+    Default = true,
+}):OnChanged(function(v)
+    State.FastAttack = v
+end)
+
+Tabs.FarmSettings:AddSlider("FastAttackDelay", {
+    Title = "Fast Attack Delay",
+    Description = "Seconds between attacks (lower = faster)",
+    Default = 0.1,
+    Min = 0.03,
+    Max = 0.5,
+    Rounding = 2,
+}):OnChanged(function(v)
+    State.AttackDelay = v
+end)
+
+Tabs.FarmSettings:AddToggle("BringMob", {
+    Title = "Bring Mob",
+    Description = "Pulls nearby mobs of the same type onto your target",
+    Default = false,
+}):OnChanged(function(v)
+    State.BringMob = v
+end)
+
+Tabs.FarmSettings:AddSlider("BringMobCount", {
+    Title = "Mobs To Bring",
+    Description = "How many mobs to gather at once",
+    Default = 3,
+    Min = 1,
+    Max = 10,
+    Rounding = 0,
+}):OnChanged(function(v)
+    State.BringCount = v
+end)
+
+Tabs.FarmSettings:AddSlider("ScriptSpeed", {
+    Title = "Script Speed",
+    Description = "Fly speed while farming (high values can get you kicked)",
+    Default = FLY_SPEED,
+    Min = 50,
+    Max = 300,
+    Rounding = 0,
+}):OnChanged(function(v)
+    FLY_SPEED = v
+end)
+
+Tabs.Raid:AddDropdown("RaidFruit", {
+    Title = "Raid Fruit",
+    Description = "Which raid (fruit chip) to buy and run",
+    Values = RAID_FRUITS,
+    Multi = false,
+    Default = 1,
+}):OnChanged(function(v)
+    State.RaidFruit = v
+end)
+
+Tabs.Raid:AddDropdown("ChipSource", {
+    Title = "Buy Chip With",
+    Description = "Pay for the chip with money (Beli) or a fruit",
+    Values = {"Beli", "Fruit"},
+    Multi = false,
+    Default = 1,
+}):OnChanged(function(v)
+    State.ChipSource = v
+end)
+
+-- Who buys the chip: you ("Me") or another player in the server.
+-- If it is another player, you wait on a platform next to the raid console
+-- while they buy the chip and start the raid.
+local ChipBuyerDD = Tabs.Raid:AddDropdown("ChipBuyer", {
+    Title = "Chip Buyer",
+    Description = "Me = this account buys & starts. A player = you wait on the platform for them",
+    Values = {"Me"},
+    Multi = false,
+    Default = 1,
+})
+ChipBuyerDD:OnChanged(function(v)
+    State.ChipBuyer = v
+end)
+
+local function refreshBuyers()
+    local list = {"Me"}
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl ~= Player then table.insert(list, pl.Name) end
+    end
+    pcall(function() ChipBuyerDD:SetValues(list) end)
+    if not table.find(list, State.ChipBuyer) then
+        State.ChipBuyer = "Me"
+        pcall(function() ChipBuyerDD:SetValue("Me") end)
+    end
+end
+Players.PlayerAdded:Connect(function() task.defer(refreshBuyers) end)
+Players.PlayerRemoving:Connect(function() task.delay(0.5, refreshBuyers) end)
+refreshBuyers()
+
+Tabs.Raid:AddButton({
+    Title = "Refresh Players",
+    Description = "Reloads the player list for Chip Buyer",
+    Callback = refreshBuyers,
+})
+
+Tabs.Raid:AddToggle("AutoBuyChip", {
+    Title = "Auto Buy Chip",
+    Description = "Flies to the Mysterious Scientist and buys the chip when you have none",
+    Default = false,
+}):OnChanged(function(v)
+    State.BuyChip = v
+    refreshFarming()
+end)
+
+Tabs.Raid:AddToggle("AutoRaid", {
+    Title = "Auto Raid",
+    Description = "Buys the chip (or waits for the Chip Buyer), goes to Castle on the Sea / Hot and Cold island, starts the raid and clears every island",
+    Default = false,
+}):OnChanged(function(v)
+    State.Raid = v
+    refreshFarming()
+end)
+
+Tabs.Boss:AddDropdown("SelectBoss", {
+    Title = "Select Boss",
+    Description = "Pick one or more mega bosses to kill",
+    Values = BOSS_LIST,
+    Multi = true,
+    Default = {},
+}):OnChanged(function(v)
+    State.BossSelected = v
+end)
+
+Tabs.Boss:AddButton({
+    Title = "Select All Bosses",
+    Description = "Targets every boss in the list",
+    Callback = function()
+        local all = {}
+        for _, name in ipairs(BOSS_LIST) do all[name] = true end
+        Fluent.Options.SelectBoss:SetValue(all)
+    end,
+})
+
+Tabs.Boss:AddToggle("AutoKillBoss", {
+    Title = "Auto Kill Boss",
+    Description = "Flies to the selected bosses when they spawn and defeats them",
+    Default = false,
+}):OnChanged(function(v)
+    State.Boss = v
+    refreshFarming()
+end)
+
+Tabs.Sea:AddDropdown("SelectBoat", {
+    Title = "Select Boat",
+    Description = "Boat that is bought and used to sail",
+    Values = BOAT_LIST,
+    Multi = false,
+    Default = 1,
+}):OnChanged(function(v)
+    State.BoatName = v
+end)
+
+Tabs.Sea:AddDropdown("SelectSeaEvents", {
+    Title = "Sea Events",
+    Description = "Events to hunt",
+    Values = SEA_EVENT_LIST,
+    Multi = true,
+    Default = {},
+}):OnChanged(function(v)
+    State.SeaSelected = v
+end)
+
+Tabs.Sea:AddToggle("UseAllSkills", {
+    Title = "Use All Skills",
+    Description = "On Sea Beast / boats, throws every skill: Sword, Melee, Gun and Fruit",
+    Default = true,
+}):OnChanged(function(v)
+    State.UseSkills = v
+end)
+
+Tabs.Sea:AddToggle("StartSeaEvent", {
+    Title = "Start Sea Event",
+    Description = "Gets the boat, sails out and fights the selected events",
+    Default = false,
+}):OnChanged(function(v)
+    State.SeaEvent = v
+    sailStart = nil
+    refreshFarming()
+end)
+
+Tabs.Sea:AddSection("Kitsune Island")
+
+Tabs.Sea:AddToggle("AutoFindKitsune", {
+    Title = "Auto Find Kitsune Island",
+    Description = "Sails out to sea until Kitsune Island shows up",
+    Default = false,
+}):OnChanged(function(v)
+    State.KitsuneFind = v
+    kitsuneNotified = false
+    sailStart = nil
+    refreshFarming()
+end)
+
+Tabs.Sea:AddToggle("AutoKitsuneIsland", {
+    Title = "Auto Kitsune Island",
+    Description = "Finds the island, flies to it and stays there",
+    Default = false,
+}):OnChanged(function(v)
+    State.KitsuneAuto = v
+    kitsuneNotified = false
+    sailStart = nil
+    refreshFarming()
+end)
+
+Tabs.Sea:AddToggle("AutoCollectEmbers", {
+    Title = "Auto Collect Azure Embers",
+    Description = "Flies to the blue flames and collects them",
+    Default = false,
+}):OnChanged(function(v)
+    State.CollectEmbers = v
+    refreshFarming()
+end)
+
+Tabs.Sea:AddSlider("TradeAmount", {
+    Title = "Trade Amount",
+    Description = "How many embers to trade each time",
+    Default = 5,
+    Min = 1,
+    Max = 25,
+    Rounding = 0,
+}):OnChanged(function(v)
+    State.TradeAmount = v
+end)
+
+Tabs.Sea:AddToggle("AutoTradeEmbers", {
+    Title = "Auto Trade Embers",
+    Description = "Trades your Azure Embers automatically",
+    Default = false,
+}):OnChanged(function(v)
+    State.TradeEmbers = v
+end)
+
+Tabs.Sea:AddSection("Mirage Island")
+
+Tabs.Sea:AddToggle("FindMirage", {
+    Title = "Find Mirage Island",
+    Description = "Sails out to sea until Mirage Island shows up",
+    Default = false,
+}):OnChanged(function(v)
+    State.MirageFind = v
+    mirageNotified = false
+    sailStart = nil
+    refreshFarming()
+end)
+
+Tabs.Sea:AddToggle("MirageMoon", {
+    Title = "Auto Highest Point + Look At Moon",
+    Description = "Flies to the highest point of Mirage Island and looks at the moon",
+    Default = false,
+}):OnChanged(function(v)
+    State.MirageMoon = v
+    if not v and not State.MirageV3 then restoreCamera() end
+    sailStart = nil
+    refreshFarming()
+end)
+
+Tabs.Sea:AddToggle("MirageV3", {
+    Title = "Auto Activate V3",
+    Description = "At the highest point, looks at the moon and uses the race ability (T)",
+    Default = false,
+}):OnChanged(function(v)
+    State.MirageV3 = v
+    if not v and not State.MirageMoon then restoreCamera() end
+    sailStart = nil
+    refreshFarming()
+end)
+
+Tabs.Sea:AddToggle("MirageGears", {
+    Title = "Auto Collect Gears",
+    Description = "Collects the gears on Mirage Island",
+    Default = false,
+}):OnChanged(function(v)
+    State.MirageGears = v
+    refreshFarming()
+end)
+
+Tabs.FarmSettings:AddToggle("AutoV3", {
+    Title = "Auto Activate V3",
+    Description = "Uses the race V3 ability (T) while farming",
+    Default = false,
+}):OnChanged(function(v)
+    State.AutoV3 = v
+end)
+
+Tabs.FarmSettings:AddToggle("AutoV4", {
+    Title = "Auto Activate V4",
+    Description = "Turns on race V4 (Y) when the awakening bar is full",
+    Default = false,
+}):OnChanged(function(v)
+    State.AutoV4 = v
+end)
+
+-- Attack loop (runs at the Fast Attack Delay while in combat)
+task.spawn(function()
+    while task.wait(State.AttackDelay) do
+        if State.Farming and tick() < State.CombatUntil then
+            pcall(attack)
+        end
+    end
+end)
+
+---------------------------------------------------------------------
+-- Farm loop
+---------------------------------------------------------------------
+task.spawn(function()
+    while task.wait(0.15) do
+        if not State.Farming then
+            -- switched off: make sure nothing is left running
+            if bv then setHover(false) end
+            if currentTween and currentTween.PlaybackState == Enum.PlaybackState.Playing then currentTween:Cancel() end
+            setStatus("Idle")
+            continue
+        end
+        local ok, err = pcall(function()
+            local root, hum = getRoot()
+            if not root or not hum or hum.Health <= 0 then return end
+
+            -- Priority: fruits > Elite Hunter > Castle Raid > method farm
+            if State.CollectFruits and collectFruit() then return end
+            if (State.Raid or State.BuyChip) and raidFarm() then return end
+            if State.Elite and eliteHunter() then return end
+            if State.Boss and bossFarm() then return end
+            if (State.KitsuneFind or State.KitsuneAuto or State.CollectEmbers) and kitsuneTick() then return end
+            if (State.MirageFind or State.MirageMoon or State.MirageV3 or State.MirageGears) and mirageTick() then return end
+            if State.SeaEvent and seaEvents() then return end
+            if State.Castle and castleRaid() then return end
+            if not (State.StartFarm or State.GetQuest) then
+                setHover(false)
+                return
+            end
+
+            -- Level farm: first make sure we are in the sea that fits our level
+            if State.Method == "Level" and CURRENT_SEA then
+                local lvl = getLevel()
+                local want = lvl >= 1500 and 3 or (lvl >= 700 and 2 or 1)
+                if want ~= CURRENT_SEA and seaTravelTries < 3 then
+                    setStatus("Lv " .. lvl .. " | travelling to Sea " .. want)
+                    if tick() - lastSeaTravel > 20 then
+                        lastSeaTravel = tick()
+                        seaTravelTries += 1
+                        Fluent:Notify({Title = "Dark Hub", Content = "Your level fits Sea " .. want .. ". Travelling there - run the script again after the teleport.", Duration = 10})
+                        pcall(function() RS.Remotes.CommF_:InvokeServer(SEA_TRAVEL[want]) end)
+                    end
+                    return
+                end
+            end
+
+            local data = State.Method == "Level" and getLevelQuest() or Methods[State.Method]
+            if not data then
+                setStatus("Lv " .. getLevel() .. " | no quest found in this sea")
+                return
+            end
+
+            -- Level farm: if you already have a quest, kill ITS mob
+            if State.Method == "Level" then
+                local am = activeQuestMob()
+                if am and am ~= data.Mobs[1] then
+                    data = {Mobs = {am}, QuestMob = am, Label = "active quest", Quest = data.Quest,
+                        Submerged = SUBMERGED_MOBS[am] == true}
+                end
+            end
+
+            -- 0) quest is on Submerged Island: go down with the Submarine Worker first
+            local lvlText = "Lv " .. getLevel() .. " | " .. (data.Label or State.Method) .. " | " .. (data.Mobs[1] or "?")
+            if data.Submerged then
+                -- already down there? (mob visible, spawn close, or we just travelled)
+                local sp = findSpawn(data.Mobs)
+                local inSub = findEnemy(data.Mobs) ~= nil
+                    or (sp and (sp.Position - root.Position).Magnitude < 1500)
+                    or tick() < (State.SubUntil or 0)
+                if not inSub then
+                    setStatus(lvlText .. " | going to Submerged Island")
+                    goSubmerged()
+                    return
+                end
+            end
+
+            -- 1) quest: take it once, then only go back to the NPC after it is finished
+            if State.GetQuest and data.Quest then
+                if hasQuest() then
+                    questGoneSince = nil
+                else
+                    questGoneSince = questGoneSince or tick()
+                    if tick() - questGoneSince > 3 then
+                        setStatus(lvlText .. " | taking quest")
+                        takeQuest(data)
+                        questGoneSince = nil
+                    end
+                end
+            end
+
+            -- 2) leave the NPC and go kill the mobs
+            if farmMobs(data) then
+                setStatus(lvlText .. " | fighting")
+            else
+                -- nothing alive: wait for respawn at the mob spawn point
+                local sp = findSpawn(data.Mobs)
+                setStatus(lvlText .. (sp and " | flying to the mobs" or " | spawn not found"))
+                if sp then
+                    setHover(true)
+                    flyTo(sp.CFrame * CFrame.new(0, HOVER_HEIGHT + 8, 0))
+                else
+                    setHover(false)
+                end
+            end
+        end)
+        if not ok then warn("[Dark Hub] " .. tostring(err)) end
+    end
+end)
+
+---------------------------------------------------------------------
+-- Settings / config
+---------------------------------------------------------------------
+SaveManager:SetLibrary(Fluent)
+InterfaceManager:SetLibrary(Fluent)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({})
+InterfaceManager:SetFolder("DarkHub")
+SaveManager:SetFolder("DarkHub/BloxFruits")
+InterfaceManager:BuildInterfaceSection(Tabs.Settings)
+SaveManager:BuildConfigSection(Tabs.Settings)
+
+---------------------------------------------------------------------
+-- Floating robot button: tap to open / close the UI (drag to move)
+---------------------------------------------------------------------
+do
+    local UIS = game:GetService("UserInputService")
+    local parent = (gethui and gethui()) or game:GetService("CoreGui")
+
+    local old = parent:FindFirstChild("DarkHubToggle")
+    if old then old:Destroy() end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "DarkHubToggle"
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 999
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    pcall(function()
+        if syn and syn.protect_gui then syn.protect_gui(gui) end
+    end)
+    gui.Parent = parent
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.fromOffset(52, 52)
+    btn.Position = UDim2.new(0, 20, 0.5, -26)
+    btn.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
+    btn.AutoButtonColor = false
+    btn.Text = "🤖"
+    btn.TextSize = 28
+    btn.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = btn
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(130, 90, 255)
+    stroke.Thickness = 2
+    stroke.Parent = btn
+
+    local dragging, moved, dragStart, startPos = false, false, nil, nil
+
+    btn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, moved = true, false
+            dragStart, startPos = input.Position, btn.Position
+        end
+    end)
+
+    UIS.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            if delta.Magnitude > 6 then moved = true end
+            if moved then
+                btn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+            end
+        end
+    end)
+
+    UIS.InputEnded:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+            dragging = false
+            if not moved then
+                Window:Minimize() -- toggles open/closed
+            end
+        end
+    end)
+end
+
+Window:SelectTab(1)
+Fluent:Notify({Title = "Dark Hub", Content = "Loaded successfully.", Duration = 5})
